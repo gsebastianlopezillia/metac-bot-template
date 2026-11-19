@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import sys
 import warnings
 from typing import Any, Sequence
+
+import dotenv
 
 
 # Placeholder values shipped in .env.template. If a real env var still equals
@@ -29,6 +32,59 @@ _PLACEHOLDER_ENV_VALUES = {
 def _is_real_env(name: str) -> bool:
     val = os.getenv(name)
     return bool(val and val.strip() and val.strip() not in _PLACEHOLDER_ENV_VALUES)
+
+
+def load_and_normalize_env(repo_dir: Path | None = None) -> None:
+    """Carga .env local (y fallback del workspace Wonka) y normaliza alias de Gemini/Metaculus."""
+    base_dir = repo_dir or Path(__file__).resolve().parent
+    local_env = base_dir / ".env"
+    if local_env.is_file():
+        dotenv.load_dotenv(local_env, override=False)
+
+    # Fallback local en monorepo Wonka (inofensivo en GitHub Actions donde no existe)
+    workspace_env = base_dir.parent.parent / ".env"
+    if workspace_env.is_file():
+        dotenv.load_dotenv(workspace_env, override=False)
+
+    # Alias configurados por el Director -> variables estándar del SDK / LiteLLM
+    if not _is_real_env("METACULUS_TOKEN") and _is_real_env("METACULUS_BOT_1_API_KEY"):
+        os.environ["METACULUS_TOKEN"] = os.environ["METACULUS_BOT_1_API_KEY"].strip()
+
+    if not _is_real_env("GEMINI_API_KEY") and _is_real_env("GEMINI_METACULUS_BOT_1_API_KEY"):
+        os.environ["GEMINI_API_KEY"] = os.environ["GEMINI_METACULUS_BOT_1_API_KEY"].strip()
+
+
+def build_llm_config() -> dict[str, Any] | None:
+    """Devuelve configuración de modelos Gemini vía LiteLLM cuando GEMINI_API_KEY está activa.
+
+    Si no hay GEMINI_API_KEY, devuelve None para que forecasting-tools use sus defaults.
+    """
+    if not _is_real_env("GEMINI_API_KEY"):
+        return None
+
+    from forecasting_tools import GeneralLlm
+
+    default_model = os.getenv("GEMINI_DEFAULT_MODEL", "gemini/gemini-3.5-flash-lite").strip()
+    fast_model = os.getenv("GEMINI_FAST_MODEL", "gemini/gemini-3.5-flash-lite").strip()
+
+    # Si hay AskNews configurado lo aprovechamos; si no, Gemini Flash hace research + oracle_enrichment
+    has_asknews = _is_real_env("ASKNEWS_CLIENT_ID") and _is_real_env("ASKNEWS_SECRET")
+    researcher: Any = (
+        "asknews/news-summaries"
+        if has_asknews
+        else GeneralLlm(model=fast_model, timeout=60, allowed_tries=2)
+    )
+
+    return {
+        "default": GeneralLlm(
+            model=default_model,
+            timeout=90,
+            allowed_tries=2,
+        ),
+        "researcher": researcher,
+        "summarizer": fast_model,
+        "parser": fast_model,
+    }
 
 
 def silence_noisy_dependencies() -> None:
@@ -70,14 +126,17 @@ def check_environment(strict: bool = True) -> None:
 
     has_llm_key = any(
         _is_real_env(k)
-        for k in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+        for k in (
+            "GEMINI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+        )
     )
     if not has_llm_key:
         problems.append(
-            "No LLM key set. Set OPENROUTER_API_KEY, OPENAI_API_KEY or "
-            "ANTHROPIC_API_KEY (free OpenRouter credits: "
-            "https://forms.gle/aQdYMq9Pisrf1v7d8). The Metaculus LLM proxy that "
-            "the bot used to fall back to is no longer available."
+            "No LLM key set. Set GEMINI_API_KEY (or GEMINI_METACULUS_BOT_1_API_KEY), "
+            "OPENROUTER_API_KEY, OPENAI_API_KEY or ANTHROPIC_API_KEY."
         )
 
     if problems:

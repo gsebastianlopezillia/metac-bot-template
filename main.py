@@ -8,12 +8,23 @@ import dotenv
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
+    build_llm_config,
     check_environment,
+    load_and_normalize_env,
     print_run_summary_banner,
     print_startup_banner,
     silence_noisy_dependencies,
 )
+from playbooks.dispatcher import (
+    CORE_FORECASTING_RULES,
+    calibrate_binary_with_context,
+    calibrate_multichoice_object,
+    route_and_build_context,
+    widen_percentile_objects,
+)
+from playbooks.politics_geo_law import PlaybookContext
 
+load_and_normalize_env()
 silence_noisy_dependencies()
 
 from forecasting_tools import (
@@ -124,42 +135,70 @@ class FallTemplateBot2026(ForecastBot):
         1  # Set this to whatever works for your search-provider/ai-model rate limits
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
-    _structure_output_validation_samples = 2
+    _structure_output_validation_samples = 1
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._playbook_contexts: dict[int, PlaybookContext] = {}
+
+    def _get_playbook_context(self, question: MetaculusQuestion) -> PlaybookContext | None:
+        qid = getattr(question, "id_of_question", None) or getattr(question, "id_of_post", None)
+        return self._playbook_contexts.get(qid) if qid is not None else None
+
+    def _get_playbook_addendum(self, question: MetaculusQuestion) -> str:
+        ctx = self._get_playbook_context(question)
+        domain_part = f"\n{ctx.prompt_addendum}\n" if ctx is not None else ""
+        return f"\n{CORE_FORECASTING_RULES}\n{domain_part}"
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
+            # 1. Enrutamiento por categoría y fuentes en vivo a 0 tokens LLM
+            ctx, enrichment = await asyncio.to_thread(route_and_build_context, question)
+            qid = getattr(question, "id_of_question", None) or getattr(question, "id_of_post", None)
+            if ctx is not None and qid is not None:
+                self._playbook_contexts[qid] = ctx
+
             research = ""
             researcher = self.get_llm("researcher")
+            is_web_researcher = isinstance(researcher, str) and (
+                researcher.startswith("asknews/") or researcher.startswith("smart-searcher")
+            )
 
-            prompt = self._get_research_prompt(question, researcher)
+            # Si ya tenemos evidencia real en vivo y el researcher no navega la web,
+            # evitamos quemar tokens y contaminar con conocimiento viejo del modelo.
+            if is_web_researcher or len(enrichment) < 180:
+                prompt = self._get_research_prompt(question, researcher)
+                if isinstance(researcher, GeneralLlm):
+                    research = await researcher.invoke(prompt)
+                elif (
+                    researcher == "asknews/news-summaries"
+                    or researcher == "asknews/deep-research/low-depth"
+                    or researcher == "asknews/deep-research/medium-depth"
+                    or researcher == "asknews/deep-research/high-depth"
+                ):
+                    research = await AskNewsSearcher().call_preconfigured_version(
+                        researcher, prompt
+                    )
+                elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
+                    model_name = researcher.removeprefix("smart-searcher/")
+                    searcher = SmartSearcher(
+                        model=model_name,
+                        temperature=0,
+                        num_searches_to_run=2,
+                        num_sites_per_search=10,
+                        use_advanced_filters=False,
+                    )
+                    research = await searcher.invoke(prompt)
+                elif not researcher or researcher == "None" or researcher == "no_research":
+                    research = ""
+                else:
+                    research = await self.get_llm("researcher", "llm").invoke(prompt)
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+            if enrichment:
+                research = f"{enrichment}\n\n{research}".strip() if research else enrichment
+
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
@@ -222,6 +261,7 @@ class FallTemplateBot2026(ForecastBot):
             (d) A brief description of a scenario that results in a Yes outcome.
 
             You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            {self._get_playbook_addendum(question)}
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -250,12 +290,20 @@ class FallTemplateBot2026(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        raw_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        cal = calibrate_binary_with_context(raw_pred, self._get_playbook_context(question))
+        decimal_pred = cal.calibrated_probability
+        calibration_note = (
+            f"\n\n[Calibration] raw={raw_pred:.4f} -> calibrated={decimal_pred:.4f} "
+            f"steps={list(cal.applied_steps)}"
+        )
 
         logger.info(
-            f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
+            f"Forecasted URL {question.page_url} with prediction: {decimal_pred} (raw={raw_pred})."
         )
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+        return ReasonedPrediction(
+            prediction_value=decimal_pred, reasoning=f"{reasoning}{calibration_note}"
+        )
 
     ##################################### MULTIPLE CHOICE QUESTIONS #####################################
 
@@ -290,6 +338,7 @@ class FallTemplateBot2026(ForecastBot):
             (b) The status quo outcome if nothing changed.
             (c) A description of a scenario that results in an unexpected outcome.
 
+            {self._get_playbook_addendum(question)}
             {self._get_conditional_disclaimer_if_necessary(question)}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
@@ -326,6 +375,7 @@ class FallTemplateBot2026(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
+        predicted_option_list = calibrate_multichoice_object(predicted_option_list)
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}."
@@ -379,6 +429,7 @@ class FallTemplateBot2026(ForecastBot):
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
+            {self._get_playbook_addendum(question)}
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
@@ -424,7 +475,8 @@ class FallTemplateBot2026(ForecastBot):
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         )
-        prediction = NumericDistribution.from_question(percentile_list, question)
+        widened_percentiles = widen_percentile_objects(percentile_list, question)
+        prediction = NumericDistribution.from_question(widened_percentiles, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
@@ -474,6 +526,7 @@ class FallTemplateBot2026(ForecastBot):
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
+            {self._get_playbook_addendum(question)}
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
@@ -524,7 +577,8 @@ class FallTemplateBot2026(ForecastBot):
             )
             for percentile in date_percentile_list
         ]
-        prediction = NumericDistribution.from_question(percentile_list, question)
+        widened_percentiles = widen_percentile_objects(percentile_list, question)
+        prediction = NumericDistribution.from_question(widened_percentiles, question)
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
         )
@@ -697,36 +751,38 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run forecasts locally without publishing to Metaculus",
+    )
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=None,
+        help="Optional cap on number of questions (useful for low-token dry runs)",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    publish_to_metaculus = True
+    publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
-    template_bot = FallTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
-        use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
-    )
+    llm_config = build_llm_config()
+    bot_kwargs: dict = {
+        "research_reports_per_question": 1,
+        "predictions_per_research_report": 1 if args.dry_run else 3,
+        "use_research_summary_to_forecast": False,
+        "publish_reports_to_metaculus": publish_to_metaculus,
+        "folder_to_save_reports_to": None,
+        "skip_previously_forecasted_questions": True,
+        "extra_metadata_in_explanation": True,
+    }
+    if llm_config is not None:
+        bot_kwargs["llms"] = llm_config
+
+    template_bot = FallTemplateBot2026(**bot_kwargs)
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
@@ -769,11 +825,19 @@ if __name__ == "__main__":
         # the recommended target for smoke-testing your bot.
         # https://www.metaculus.com/tournament/bot-testing-area/
         template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
+        if args.max_questions is not None:
+            test_qs = client.get_all_open_questions_from_tournament("bot-testing-area")
+            forecast_reports = asyncio.run(
+                template_bot.forecast_questions(
+                    test_qs[: args.max_questions], return_exceptions=True
+                )
             )
-        )
+        else:
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    "bot-testing-area", return_exceptions=True
+                )
+            )
 
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(
