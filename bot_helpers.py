@@ -72,18 +72,18 @@ def build_llm_config() -> dict[str, Any] | None:
     researcher: Any = (
         "asknews/news-summaries"
         if has_asknews
-        else GeneralLlm(model=fast_model, timeout=60, allowed_tries=2)
+        else GeneralLlm(model=fast_model, timeout=60, allowed_tries=4)
     )
 
     return {
         "default": GeneralLlm(
             model=default_model,
             timeout=90,
-            allowed_tries=2,
+            allowed_tries=4,
         ),
         "researcher": researcher,
-        "summarizer": fast_model,
-        "parser": fast_model,
+        "summarizer": GeneralLlm(model=fast_model, timeout=60, allowed_tries=4),
+        "parser": GeneralLlm(model=fast_model, timeout=60, allowed_tries=4),
     }
 
 

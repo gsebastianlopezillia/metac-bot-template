@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import os
+import time
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -140,6 +142,20 @@ class FallTemplateBot2026(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._playbook_contexts: dict[int, PlaybookContext] = {}
+        self._llm_throttle_lock = asyncio.Lock()
+        self._last_llm_call_ts = 0.0
+        self._min_llm_interval = float(os.getenv("GEMINI_MIN_INTERVAL_SECONDS", "5.0"))
+
+    async def _throttle_llm(self) -> None:
+        """Espacia llamadas al LLM para respetar el límite RPM del tier gratuito de Gemini."""
+        if self._min_llm_interval <= 0:
+            return
+        async with self._llm_throttle_lock:
+            elapsed = time.monotonic() - self._last_llm_call_ts
+            wait_s = self._min_llm_interval - elapsed
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            self._last_llm_call_ts = time.monotonic()
 
     def _get_playbook_context(self, question: MetaculusQuestion) -> PlaybookContext | None:
         qid = getattr(question, "id_of_question", None) or getattr(question, "id_of_post", None)
@@ -275,6 +291,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
+        await self._throttle_llm()
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
@@ -283,6 +300,7 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
+        await self._throttle_llm()
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
             BinaryPrediction,
@@ -366,8 +384,10 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
+        await self._throttle_llm()
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        await self._throttle_llm()
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
             output_type=PredictedOptionList,
@@ -451,6 +471,7 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
+        await self._throttle_llm()
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
@@ -468,6 +489,7 @@ class FallTemplateBot2026(ForecastBot):
             - Turn any values that are in scientific notation into regular numbers.
             """
         )
+        await self._throttle_llm()
         percentile_list: list[Percentile] = await structure_output(
             reasoning,
             list[Percentile],
@@ -770,9 +792,11 @@ if __name__ == "__main__":
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     llm_config = build_llm_config()
+    default_preds = int(os.getenv("PREDICTIONS_PER_QUESTION", "2"))
+    max_per_run = args.max_questions or int(os.getenv("MAX_QUESTIONS_PER_RUN", "5"))
     bot_kwargs: dict = {
         "research_reports_per_question": 1,
-        "predictions_per_research_report": 1 if args.dry_run else 3,
+        "predictions_per_research_report": 1 if args.dry_run else default_preds,
         "use_research_summary_to_forecast": False,
         "publish_reports_to_metaculus": publish_to_metaculus,
         "folder_to_save_reports_to": None,
@@ -798,17 +822,23 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+        # Limitar preguntas por corrida para dosificar la cuota de Gemini;
+        # el cron cada 20 min retoma automáticamente las restantes.
+        seasonal_qs = client.get_all_open_questions_from_tournament(
+            client.CURRENT_AI_COMPETITION_ID
+        )
+        minibench_qs = client.get_all_open_questions_from_tournament(
+            client.CURRENT_MINIBENCH_ID
+        )
+        open_qs = [
+            q for q in (seasonal_qs + minibench_qs)
+            if not getattr(q, "already_forecasted", False)
+        ]
+        forecast_reports = asyncio.run(
+            template_bot.forecast_questions(
+                open_qs[:max_per_run], return_exceptions=True
             )
         )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
         # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
